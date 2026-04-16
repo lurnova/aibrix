@@ -28,21 +28,20 @@ def _apply_gpu_model_runner_patches(module):
     GPUModelRunner = module.GPUModelRunner
 
     # ------------------------------------------------------------------
-    # Source-patch detection: if GPUModelRunner already has patched signature,
-    # the source-code patch is in place and we should not double-patch.
+    # Double-patch detection: check if our monkey-patch or source-patch
+    # is ACTUALLY in place by inspecting the method itself — not class
+    # flags which can survive process forks without the actual binding.
     # ------------------------------------------------------------------
-    if getattr(GPUModelRunner, "_aibrix_patched", False):
-        logger.info("[AIBrix] vLLM source patch detected, skipping patch")
+    if GPUModelRunner.execute_model.__name__ == "_patched_execute_model":
+        logger.info("[AIBrix] Already monkey-patched, skipping")
         return
 
-    # Check if _update_states already accepts load_results (source patch)
+    # Source-patch detection: _update_states accepts load_results
     import inspect
-
     sig = inspect.signature(GPUModelRunner._update_states)
     if "load_results" in sig.parameters:
         logger.info(
-            "[AIBrix] vLLM source patch detected, _update_states has "
-            "load_results, skipping patch"
+            "[AIBrix] vLLM source patch detected, skipping monkey-patch"
         )
         return
 
