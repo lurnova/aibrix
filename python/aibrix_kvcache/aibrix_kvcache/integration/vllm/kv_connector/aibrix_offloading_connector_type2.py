@@ -792,6 +792,12 @@ class AIBrixOffloadingConnector(KVConnectorBase_V1):
         if not block_hashes:
             return 0, False
 
+        # Save block_hashes for this request so we can map worker
+        # reports (req_id -> num_tokens_saved) to vLLM block hashes
+        req_id = getattr(request, "request_id", None)
+        if req_id is not None:
+            scheduler._request_block_hashes[req_id] = list(block_hashes)
+
         block_size = scheduler.engine_block_ntokens
 
         # Count how many consecutive blocks starting from
@@ -828,11 +834,12 @@ class AIBrixOffloadingConnector(KVConnectorBase_V1):
         saved.clear()
         return meta
 
-    def receive_connector_worker_meta(
-        self, worker_meta: Optional["KVConnectorWorkerMetadata"]
-    ) -> None:
-        """Forward worker metadata to the scheduler-side cache tracker."""
-        if self.connector_scheduler is not None:
+    def update_connector_output(self, connector_output) -> None:
+        """Process worker-side output to update scheduler cache tracker."""
+        worker_meta = getattr(
+            connector_output, "kv_connector_worker_meta", None
+        )
+        if self.connector_scheduler is not None and worker_meta is not None:
             self.connector_scheduler.receive_connector_worker_meta(worker_meta)
 
     def update_state_after_alloc(

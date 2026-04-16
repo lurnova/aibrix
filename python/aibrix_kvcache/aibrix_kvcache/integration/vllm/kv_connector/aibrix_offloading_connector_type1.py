@@ -613,10 +613,6 @@ class AIBrixOffloadingConnectorScheduler:
             context_len = req.num_computed_tokens
             query_len = scheduler_output.num_scheduled_tokens[req_id]
 
-            # Save block_hashes for mapping worker reports to vLLM hashes
-            if hasattr(req, "block_hashes") and req.block_hashes:
-                self._request_block_hashes[req_id] = list(req.block_hashes)
-
             if context_len >= prompt_len:
                 continue
 
@@ -1487,11 +1483,17 @@ class AIBrixOffloadingConnector(KVConnectorBase_V1):
         saved.clear()
         return meta
 
-    def receive_connector_worker_meta(
-        self, worker_meta: Optional[KVConnectorWorkerMetadata]
-    ) -> None:
-        """Forward worker metadata to the scheduler-side cache tracker."""
-        if self.connector_scheduler is not None:
+    def update_connector_output(self, connector_output) -> None:
+        """Process worker-side output to update scheduler cache tracker.
+
+        Called by vLLM scheduler after each engine step. Extracts
+        kv_connector_worker_meta from the KVConnectorOutput and forwards
+        it to the scheduler to update the set of cached block hashes.
+        """
+        worker_meta = getattr(
+            connector_output, "kv_connector_worker_meta", None
+        )
+        if self.connector_scheduler is not None and worker_meta is not None:
             self.connector_scheduler.receive_connector_worker_meta(worker_meta)
 
     # ==============================
@@ -1520,6 +1522,12 @@ class AIBrixOffloadingConnector(KVConnectorBase_V1):
         block_hashes = getattr(request, "block_hashes", None)
         if not block_hashes:
             return 0, False
+
+        # Save block_hashes for this request so we can map worker
+        # reports (req_id -> num_tokens_saved) to vLLM block hashes
+        req_id = getattr(request, "request_id", None)
+        if req_id is not None:
+            scheduler._request_block_hashes[req_id] = list(block_hashes)
 
         block_size = scheduler.engine_block_ntokens
 
