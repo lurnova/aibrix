@@ -92,12 +92,16 @@ def _apply_gpu_model_runner_patches(module):
 
 
 def aibrix_patch_vllm():
-    """Apply AIBrix patches to vLLM"""
-    global _patches_applied
-    if _patches_applied:
-        logger.info("[AIBrix] Already patched — skipping")
-        return
+    """Apply AIBrix patches to vLLM.
 
+    NOTE: We do NOT use the module-level _patches_applied flag as the
+    sole guard. In vLLM V1 the connector module is imported in the
+    APIServer process (parent), then EngineCore is forked. The forked
+    process inherits _patches_applied=True but gets a FRESH import of
+    GPUModelRunner, so the patch must be re-applied. The class-level
+    _aibrix_patched attribute on GPUModelRunner is the authoritative
+    guard (checked inside _apply_gpu_model_runner_patches).
+    """
     # Patch GPUModelRunner
     try:
         module = importlib.import_module(VLLM_V1_WORKER_GPU_MODEL_RUNNER_MODULE)
