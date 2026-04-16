@@ -14,10 +14,6 @@
 
 import importlib
 import logging
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from vllm.v1.core.sched.output import SchedulerOutput
 
 logger = logging.getLogger(__name__)
 
@@ -58,21 +54,22 @@ def _apply_gpu_model_runner_patches(module):
     # ---- Patch 1: GPUModelRunner.execute_model -----------------------
     # This patch intercepts execute_model to:
     # 1. Call kv_connector_load_before_update() before _update_states
-    # 2. Store load_results in context for _update_states to use
+    #    to load KV from external cache into GPU buffers.
+    #
+    # NOTE: With get_num_new_matched_tokens() properly implemented,
+    # the scheduler already adjusts num_computed_tokens and
+    # num_scheduled_tokens. The monkey-patch no longer needs to
+    # preprocess scheduler_output — it only needs to trigger the
+    # actual KV data transfer.
     _orig_execute_model = GPUModelRunner.execute_model
 
     def _patched_execute_model(self, scheduler_output, *args, **kwargs):
         """Wrapped execute_model that calls KV connector before state updates"""
-        # Clear previous load_results
-        self._aibrix_load_results = {}
-
         # Get load_results from KV connector before _update_states
         if has_kv_transfer_group() and hasattr(
             self, "kv_connector_load_before_update"
         ):
-            self._aibrix_load_results = self.kv_connector_load_before_update(
-                scheduler_output
-            )
+            self.kv_connector_load_before_update(scheduler_output)
         elif has_kv_transfer_group():
             # Fallback: call directly using mixin method
             from vllm.distributed.kv_transfer import get_kv_transfer_group
@@ -82,114 +79,16 @@ def _apply_gpu_model_runner_patches(module):
                 kv_connector.bind_connector_metadata(
                     scheduler_output.kv_connector_metadata
                 )
-                self._aibrix_load_results = (
-                    kv_connector.start_load_kv_before_update()
-                )
+                kv_connector.start_load_kv_before_update()
 
         # Call original execute_model - it will call _update_states
         return _orig_execute_model(self, scheduler_output, *args, **kwargs)
 
     GPUModelRunner.execute_model = _patched_execute_model
 
-    # ---- Patch 2: GPUModelRunner._update_states ----------------------
-    # This patch pre-processes load_results before calling original
-    # _update_states, then fixes up cached request states afterward.
-    _orig_update_states = GPUModelRunner._update_states
-
-    def _patched_update_states(self, scheduler_output: "SchedulerOutput"):
-        """Wrapped _update_states that handles AIBrix KV load_results."""
-        load_results = getattr(self, "_aibrix_load_results", {})
-
-        # 1. Adjust scheduler_output before original
-        # 1.1 For new requests: modify scheduler_output.scheduled_new_reqs in
-        # place
-        _preprocess_new_reqs(scheduler_output, load_results)
-
-        # 1.2 For cached requests: modify scheduler_output.scheduled_cached_reqs
-        # in place.
-        _preprocess_cached_reqs(scheduler_output, load_results)
-
-        # 2. call original _update_states ----
-        _orig_update_states(self, scheduler_output)
-
-    GPUModelRunner._update_states = _patched_update_states
-
     # Mark class so we never double-patch
     GPUModelRunner._aibrix_patched = True
     logger.info("[AIBrix] GPUModelRunner patched successfully")
-
-
-def _preprocess_new_reqs(
-    scheduler_output: "SchedulerOutput",
-    load_results: dict[str, int],
-) -> None:
-    """Pre-process load_results for new requests.
-
-    Modifies scheduler_output.scheduled_new_reqs in place:
-    - Increases num_computed_tokens by num_loaded_tokens
-    - Decreases num_scheduled_tokens by num_loaded_tokens
-    - Decreases total_num_scheduled_tokens by num_loaded_tokens
-    """
-    if not load_results:
-        return
-
-    for new_req_data in scheduler_output.scheduled_new_reqs:
-        req_id = new_req_data.req_id
-        num_loaded_tokens = load_results.get(req_id, 0)
-
-        if num_loaded_tokens <= 0:
-            continue
-
-        num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
-
-        # If all tokens would be loaded, leave at least one for compute
-        if num_loaded_tokens == num_scheduled_tokens:
-            num_loaded_tokens -= 1
-
-        # Adjust computed and scheduled tokens
-        new_req_data.num_computed_tokens += num_loaded_tokens
-        scheduler_output.num_scheduled_tokens[req_id] -= num_loaded_tokens
-        scheduler_output.total_num_scheduled_tokens -= num_loaded_tokens
-
-
-def _preprocess_cached_reqs(
-    scheduler_output: "SchedulerOutput",
-    load_results: dict[str, int],
-) -> None:
-    """Pre-process load_results for cached/running requests.
-
-    Modifies scheduler_output.scheduled_cached_reqs in place:
-    - Increases num_computed_tokens[i] by num_loaded_tokens
-    - Updates new_token_ids[i] if available
-    - Decreases num_scheduled_tokens[req_id] by num_loaded_tokens
-    - Decreases total_num_scheduled_tokens by num_loaded_tokens
-    """
-    if not load_results:
-        return
-
-    req_data = scheduler_output.scheduled_cached_reqs
-
-    for i, req_id in enumerate(req_data.req_ids):
-        num_loaded_tokens = load_results.get(req_id, 0)
-
-        if num_loaded_tokens <= 0:
-            continue
-
-        num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
-
-        # If all tokens would be loaded, leave at least one for compute
-        if num_loaded_tokens == num_scheduled_tokens:
-            num_loaded_tokens -= 1
-
-        # Adjust computed and scheduled tokens
-        req_data.num_computed_tokens[i] += num_loaded_tokens
-        if req_data.new_token_ids and req_data.new_token_ids[i]:
-            req_data.new_token_ids[i] = req_data.new_token_ids[i][
-                num_loaded_tokens:
-            ]
-
-        scheduler_output.num_scheduled_tokens[req_id] -= num_loaded_tokens
-        scheduler_output.total_num_scheduled_tokens -= num_loaded_tokens
 
 
 def aibrix_patch_vllm():

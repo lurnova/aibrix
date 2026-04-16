@@ -578,6 +578,12 @@ class AIBrixOffloadingConnectorWorker(AIBrixOffloadingConnectorWorkerType1):
         else:
             total_sent += length
 
+            # Track saved tokens for scheduler reporting via
+            # build_connector_worker_meta
+            if total_sent > 0:
+                prev = self._newly_saved_tokens.get(seq_request_id, 0)
+                self._newly_saved_tokens[seq_request_id] = prev + total_sent
+
             log_if(
                 logger,
                 logging.INFO,
@@ -772,20 +778,62 @@ class AIBrixOffloadingConnector(KVConnectorBase_V1):
         Get number of new tokens that can be loaded from the
         external KV cache beyond the num_computed_tokens.
 
-        Args:
-            request (Request): the request object.
-            num_computed_tokens (int): the number of locally
-                computed tokens for this request
-
-        Returns:
-            A tuple with the following elements:
-                - The number of tokens that can be loaded from the
-                  external KV cache beyond what is already computed.
-                - `True` if external KV cache tokens will be loaded
-                  asynchronously (between scheduler steps). Must be
-                  'False' if the first element is 0.
+        Uses the scheduler-side cache tracker (populated via
+        build_connector_worker_meta) to determine how many consecutive
+        blocks starting from num_computed_tokens are available in the
+        external L1 cache.
         """
-        return 0, False
+        if self.connector_scheduler is None:
+            return 0, False
+
+        scheduler = self.connector_scheduler
+
+        block_hashes = getattr(request, "block_hashes", None)
+        if not block_hashes:
+            return 0, False
+
+        block_size = scheduler.engine_block_ntokens
+
+        # Count how many consecutive blocks starting from
+        # num_computed_tokens are available in the external cache
+        start_block = num_computed_tokens // block_size
+        num_matched_blocks = 0
+
+        for i in range(start_block, len(block_hashes)):
+            if block_hashes[i] not in scheduler._cached_block_hashes:
+                break
+            num_matched_blocks += 1
+
+        num_matched_tokens = num_matched_blocks * block_size
+
+        # Don't exceed request length
+        max_matchable = request.num_tokens - num_computed_tokens
+        num_matched_tokens = min(num_matched_tokens, max_matchable)
+
+        return num_matched_tokens, False
+
+    def build_connector_worker_meta(
+        self,
+    ) -> Optional["KVConnectorWorkerMetadata"]:
+        """Report tokens saved to L1 cache back to the scheduler."""
+        if self.connector_worker is None:
+            return None
+        saved = self.connector_worker._newly_saved_tokens
+        if not saved:
+            return None
+        from aibrix_kvcache.integration.vllm.kv_connector.aibrix_offloading_connector_type1 import (
+            AIBrixWorkerMeta,
+        )
+        meta = AIBrixWorkerMeta(saved_tokens=dict(saved))
+        saved.clear()
+        return meta
+
+    def receive_connector_worker_meta(
+        self, worker_meta: Optional["KVConnectorWorkerMetadata"]
+    ) -> None:
+        """Forward worker metadata to the scheduler-side cache tracker."""
+        if self.connector_scheduler is not None:
+            self.connector_scheduler.receive_connector_worker_meta(worker_meta)
 
     def update_state_after_alloc(
         self,
@@ -793,21 +841,6 @@ class AIBrixOffloadingConnector(KVConnectorBase_V1):
         blocks: "KVCacheBlocks",
         num_external_tokens: int,
     ):
-        """
-        Update KVConnector state after block allocation.
-
-        If get_num_new_matched_tokens previously returned True for a
-        request, this function may be called twice for that same request -
-        first when blocks are allocated for the connector tokens to be
-        asynchronously loaded into, and second when any additional blocks
-        are allocated, after the load/transfer is complete.
-
-        Args:
-            request (Request): the request object.
-            blocks (KVCacheBlocks): the blocks allocated for the request.
-            num_external_tokens (int): the number of tokens that will be
-                loaded from the external KV cache.
-        """
         return
 
     @delegate_to("connector_scheduler")
