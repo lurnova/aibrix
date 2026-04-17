@@ -6,6 +6,7 @@ on:
       - main
       - 'fix/**'
       - 'feat/**'
+      - 'attempt/**'
     paths:
       - 'python/aibrix_kvcache/**'
       - 'build/container/Dockerfile.vllm'
