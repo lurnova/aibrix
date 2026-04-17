@@ -78,5 +78,8 @@ jobs:
             AIBRIX_REPO=https://github.com/${{ github.repository }}.git
           labels: ${{ steps.meta.outputs.labels }}
           tags: ${{ steps.meta.outputs.tags }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Cache disabled: aibrix_kvcache wheel recompiles every commit
+          # (source changes are what we iterate on), so cache gives minimal
+          # speedup but cache-to upload adds 5-10 min to each build.
+          # cache-from: type=gha
+          # cache-to: type=gha,mode=max
