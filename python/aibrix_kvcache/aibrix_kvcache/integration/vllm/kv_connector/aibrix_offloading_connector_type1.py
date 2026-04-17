@@ -899,6 +899,11 @@ class AIBrixOffloadingConnectorWorker:
         self._meta_cache: dict[str, AIBrixOffloadingConnectorCachedMeta] = {}
         # Track tokens saved to L1 cache per request (for scheduler reporting)
         self._newly_saved_tokens: dict[str, int] = {}
+        # Track vLLM block_ids that failed to load (eviction race) so we can
+        # report them to the scheduler via get_block_ids_with_load_errors().
+        # vLLM will roll back num_computed_tokens and re-schedule those tokens
+        # for recompute when kv_load_failure_policy=recompute (the default).
+        self._failed_load_block_ids: set[int] = set()
         # metrics
         self._metrics = AIBrixOffloadingConnectorMetrics(self.cache.metrics)
         logger.info(
@@ -1157,6 +1162,30 @@ class AIBrixOffloadingConnectorWorker:
             seq_context_len,
             seq_recv_len,
         )
+
+        # Detect partial load (eviction race) — if we loaded fewer tokens than
+        # the scheduler promised via load_len, report the failed block_ids so
+        # vLLM can roll back num_computed_tokens and re-schedule for recompute.
+        if seq_recv_len < aligned_query_len:
+            block_size = self.engine_block_ntokens
+            first_failed_token = aligned_context_len + seq_recv_len
+            last_failed_token = aligned_context_len + aligned_query_len
+            # seq_cached_meta.context_slot_mapping has block_size entries per
+            # block. We derive block positions from slot_mapping indices.
+            # The slot_mapping was built as:
+            #   block_ids[j] * block_size + block_offsets[k]
+            # So block at position i in slot_mapping covers tokens
+            # [i*block_size, (i+1)*block_size)
+            slot_mapping = seq_cached_meta.context_slot_mapping
+            first_block = first_failed_token // block_size
+            last_block = last_failed_token // block_size
+            for blk_idx in range(first_block, last_block):
+                token_offset = blk_idx * block_size
+                if token_offset < len(slot_mapping):
+                    slot = int(slot_mapping[token_offset].item())
+                    # slot = block_id * block_size + offset (0)
+                    block_id = slot // block_size
+                    self._failed_load_block_ids.add(block_id)
 
         if self._metrics.time_measurement_enabled:
             end.record()
@@ -1492,16 +1521,21 @@ class AIBrixOffloadingConnector(KVConnectorBase_V1):
         """
         Notifies worker-side connector ids of requests that have
         finished generating tokens.
-
-        Returns:
-            ids of requests that have finished asynchronous transfer
-            (requests that previously returned True from request_finished()),
-            tuple of (sending/saving ids, recving/loading ids or
-            (recving/loading id, num. of recv'ed/loaded tokens) pairs).
-            The finished saves/sends req ids must belong to a set provided in a
-            call to this method (this call or a prior one).
         """
         return None, None
+
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        """Report vLLM block_ids that failed to load from L1 cache.
+
+        vLLM will invalidate these blocks, roll back num_computed_tokens,
+        and re-schedule the affected tokens for recompute (when
+        kv_load_failure_policy="recompute", the default).
+        """
+        if self.connector_worker is None:
+            return set()
+        result = set(self.connector_worker._failed_load_block_ids)
+        self.connector_worker._failed_load_block_ids.clear()
+        return result
 
     def build_connector_worker_meta(
         self,
