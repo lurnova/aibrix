@@ -69,25 +69,25 @@ def _apply_gpu_model_runner_patches(module):
 
     def _patched_execute_model(self, scheduler_output, *args, **kwargs):
         """Wrapped execute_model that calls KV connector before state updates"""
-        _loud(f"_patched_execute_model called (has_kv_group={has_kv_transfer_group()})")
-        # Get load_results from KV connector before _update_states
-        if has_kv_transfer_group() and hasattr(
-            self, "kv_connector_load_before_update"
-        ):
-            _loud("calling kv_connector_load_before_update")
+        has_group = has_kv_transfer_group()
+        has_mixin_method = hasattr(self, "kv_connector_load_before_update")
+        has_meta = getattr(scheduler_output, "kv_connector_metadata", None) is not None
+        _loud(f"_patched_execute_model: has_group={has_group} has_mixin_method={has_mixin_method} has_meta={has_meta}")
+        if has_group and has_mixin_method:
+            _loud("branch: mixin")
             self.kv_connector_load_before_update(scheduler_output)
-        elif has_kv_transfer_group():
-            # Fallback: call directly using mixin method
+        elif has_group:
+            _loud("branch: fallback")
             from vllm.distributed.kv_transfer import get_kv_transfer_group
-
             kv_connector = get_kv_transfer_group()
             if scheduler_output.kv_connector_metadata is not None:
                 kv_connector.bind_connector_metadata(
                     scheduler_output.kv_connector_metadata
                 )
+                _loud("calling start_load_kv_before_update")
                 kv_connector.start_load_kv_before_update()
-
-        # Call original execute_model - it will call _update_states
+            else:
+                _loud("skipping: no metadata")
         return _orig_execute_model(self, scheduler_output, *args, **kwargs)
 
     GPUModelRunner.execute_model = _patched_execute_model
