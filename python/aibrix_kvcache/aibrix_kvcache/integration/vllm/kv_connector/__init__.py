@@ -37,7 +37,7 @@ def _apply_gpu_model_runner_patches(module):
     """Apply patches to an already-imported gpu_model_runner module."""
     GPUModelRunner = module.GPUModelRunner
 
-    _loud(f"_apply_gpu_model_runner_patches: current execute_model.__name__={GPUModelRunner.execute_model.__name__}")
+    _loud(f"_apply_gpu_model_runner_patches: GPUModelRunner id={id(GPUModelRunner)} module={GPUModelRunner.__module__} execute_model.__name__={GPUModelRunner.execute_model.__name__} execute_model id={id(GPUModelRunner.execute_model)}")
 
     if GPUModelRunner.execute_model.__name__ == "_patched_execute_model":
         _loud("Already monkey-patched, skipping")
@@ -94,7 +94,7 @@ def _apply_gpu_model_runner_patches(module):
 
     # Mark class so we never double-patch
     GPUModelRunner._aibrix_patched = True
-    _loud(f"GPUModelRunner patched successfully. New execute_model.__name__={GPUModelRunner.execute_model.__name__}")
+    _loud(f"GPUModelRunner patched. id={id(GPUModelRunner)} New execute_model id={id(GPUModelRunner.execute_model)}")
 
 
 def aibrix_patch_vllm():
