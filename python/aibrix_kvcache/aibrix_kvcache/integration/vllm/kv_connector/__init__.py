@@ -14,8 +14,18 @@
 
 import importlib
 import logging
+import os
+import sys
 
 logger = logging.getLogger(__name__)
+
+
+def _loud(msg: str) -> None:
+    """Unconditional stderr write + logger. For debugging fork race."""
+    pid = os.getpid()
+    sys.stderr.write(f"[AIBRIX-DEBUG pid={pid}] {msg}\n")
+    sys.stderr.flush()
+    logger.warning("[AIBRIX-DEBUG pid=%d] %s", pid, msg)
 
 VLLM_V1_WORKER_GPU_MODEL_RUNNER_MODULE = "vllm.v1.worker.gpu_model_runner"
 
@@ -27,25 +37,20 @@ def _apply_gpu_model_runner_patches(module):
     """Apply patches to an already-imported gpu_model_runner module."""
     GPUModelRunner = module.GPUModelRunner
 
-    # ------------------------------------------------------------------
-    # Double-patch detection: check if our monkey-patch or source-patch
-    # is ACTUALLY in place by inspecting the method itself — not class
-    # flags which can survive process forks without the actual binding.
-    # ------------------------------------------------------------------
+    _loud(f"_apply_gpu_model_runner_patches: current execute_model.__name__={GPUModelRunner.execute_model.__name__}")
+
     if GPUModelRunner.execute_model.__name__ == "_patched_execute_model":
-        logger.info("[AIBrix] Already monkey-patched, skipping")
+        _loud("Already monkey-patched, skipping")
         return
 
     # Source-patch detection: _update_states accepts load_results
     import inspect
     sig = inspect.signature(GPUModelRunner._update_states)
     if "load_results" in sig.parameters:
-        logger.info(
-            "[AIBrix] vLLM source patch detected, skipping monkey-patch"
-        )
+        _loud("vLLM source patch detected, skipping monkey-patch")
         return
 
-    logger.info("[AIBrix] Applying patches to vLLM GPUModelRunner...")
+    _loud("Applying patches to vLLM GPUModelRunner...")
 
     # Import has_kv_transfer_group at patch time to avoid import errors
     from vllm.distributed.kv_transfer import has_kv_transfer_group
@@ -64,10 +69,12 @@ def _apply_gpu_model_runner_patches(module):
 
     def _patched_execute_model(self, scheduler_output, *args, **kwargs):
         """Wrapped execute_model that calls KV connector before state updates"""
+        _loud(f"_patched_execute_model called (has_kv_group={has_kv_transfer_group()})")
         # Get load_results from KV connector before _update_states
         if has_kv_transfer_group() and hasattr(
             self, "kv_connector_load_before_update"
         ):
+            _loud("calling kv_connector_load_before_update")
             self.kv_connector_load_before_update(scheduler_output)
         elif has_kv_transfer_group():
             # Fallback: call directly using mixin method
@@ -87,28 +94,22 @@ def _apply_gpu_model_runner_patches(module):
 
     # Mark class so we never double-patch
     GPUModelRunner._aibrix_patched = True
-    logger.info("[AIBrix] GPUModelRunner patched successfully")
+    _loud(f"GPUModelRunner patched successfully. New execute_model.__name__={GPUModelRunner.execute_model.__name__}")
 
 
 def aibrix_patch_vllm():
-    """Apply AIBrix patches to vLLM.
-
-    NOTE: We do NOT use the module-level _patches_applied flag as the
-    sole guard. In vLLM V1 the connector module is imported in the
-    APIServer process (parent), then EngineCore is forked. The forked
-    process inherits _patches_applied=True but gets a FRESH import of
-    GPUModelRunner, so the patch must be re-applied. The class-level
-    _aibrix_patched attribute on GPUModelRunner is the authoritative
-    guard (checked inside _apply_gpu_model_runner_patches).
-    """
+    """Apply AIBrix patches to vLLM."""
+    _loud("aibrix_patch_vllm() invoked")
     # Patch GPUModelRunner
     try:
         module = importlib.import_module(VLLM_V1_WORKER_GPU_MODEL_RUNNER_MODULE)
         _apply_gpu_model_runner_patches(module)
     except ImportError as e:
-        logger.warning("[AIBrix] Failed to patch gpu_model_runner: %s", e)
+        _loud(f"Failed to patch gpu_model_runner: {e}")
 
     _patches_applied = True
 
 
+_loud("aibrix_kvcache.integration.vllm.kv_connector __init__.py LOADING")
 aibrix_patch_vllm()
+_loud("aibrix_kvcache.integration.vllm.kv_connector __init__.py DONE")
