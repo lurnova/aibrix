@@ -702,19 +702,6 @@ class AIBrixOffloadingConnectorScheduler:
         )
 
         logger.debug("SCHEDULER: build_connector_meta, meta=%s", meta.__dict__)
-        import sys
-        items = list(meta.items())
-        sys.stderr.write(
-            f"[AIBRIX-DEBUG-SCHED] build_connector_meta returning "
-            f"{len(items)} requests\n"
-        )
-        for rid, rmeta in items:
-            sys.stderr.write(
-                f"[AIBRIX-DEBUG-SCHED]   {rid}: context_len="
-                f"{rmeta.context_len}, query_len={rmeta.query_len}, "
-                f"load_len={rmeta.load_len}, state={rmeta.state}\n"
-            )
-        sys.stderr.flush()
 
         # 5. update scheduled requests
         for req_id in meta:
@@ -1191,31 +1178,11 @@ class AIBrixOffloadingConnectorWorker:
         self,
         metadata: AIBrixOffloadingConnectorMetadata,
     ) -> None:
-        import sys
-        items = list(metadata.items())
-        sys.stderr.write(
-            f"[AIBRIX-DEBUG] wait_for_save called: {len(items)} items\n"
-        )
-        for rid, rmeta in items:
-            sys.stderr.write(
-                f"[AIBRIX-DEBUG]   {rid}: context_len={rmeta.context_len}, "
-                f"query_len={rmeta.query_len}, load_len={rmeta.load_len}, "
-                f"state={rmeta.state}\n"
-            )
-        sys.stderr.flush()
         assert self.layers_kv_caches is not None, "layers_kv_caches is None"
 
         for seq_request_id, seq_request_meta in metadata.items():
             if seq_request_meta.query_len == 0:
-                sys.stderr.write(
-                    f"[AIBRIX-DEBUG] SKIP {seq_request_id}: query_len=0\n"
-                )
-                sys.stderr.flush()
                 continue
-            sys.stderr.write(
-                f"[AIBRIX-DEBUG] calling _send_kv_sync_impl for {seq_request_id}\n"
-            )
-            sys.stderr.flush()
             self._send_kv_sync_impl(seq_request_meta)
 
         if self._metrics.time_measurement_enabled:
@@ -1539,17 +1506,12 @@ class AIBrixOffloadingConnector(KVConnectorBase_V1):
     def build_connector_worker_meta(
         self,
     ) -> Optional[KVConnectorWorkerMetadata]:
-        """Report tokens saved to L1 cache back to the scheduler."""
-        import sys
+        """Report tokens saved to L1 cache back to the scheduler so the
+        scheduler tracker (_cached_block_hashes) can be populated, making
+        subsequent get_num_new_matched_tokens lookups accurate."""
         if self.connector_worker is None:
-            sys.stderr.write("[AIBRIX-DEBUG-BCWM] worker is None\n")
-            sys.stderr.flush()
             return None
         saved = self.connector_worker._newly_saved_tokens
-        sys.stderr.write(
-            f"[AIBRIX-DEBUG-BCWM] _newly_saved_tokens={dict(saved)}\n"
-        )
-        sys.stderr.flush()
         if not saved:
             return None
         meta = AIBrixWorkerMeta(saved_tokens=dict(saved))
@@ -1557,22 +1519,17 @@ class AIBrixOffloadingConnector(KVConnectorBase_V1):
         return meta
 
     def update_connector_output(self, connector_output) -> None:
-        """Process worker-side output to update scheduler cache tracker."""
-        import sys
+        """Process worker-side output to update scheduler cache tracker.
+
+        Called by vLLM scheduler after each engine step. Extracts
+        kv_connector_worker_meta (AIBrixWorkerMeta) and forwards it to
+        the scheduler's receive_connector_worker_meta.
+        """
         worker_meta = getattr(
             connector_output, "kv_connector_worker_meta", None
         )
-        sys.stderr.write(
-            f"[AIBRIX-DEBUG-UCO] worker_meta={worker_meta}\n"
-        )
-        sys.stderr.flush()
         if self.connector_scheduler is not None and worker_meta is not None:
             self.connector_scheduler.receive_connector_worker_meta(worker_meta)
-            sys.stderr.write(
-                f"[AIBRIX-DEBUG-UCO] tracker size after update: "
-                f"{len(self.connector_scheduler._cached_block_hashes)}\n"
-            )
-            sys.stderr.flush()
 
     # ==============================
     # Scheduler-side methods
@@ -1624,14 +1581,6 @@ class AIBrixOffloadingConnector(KVConnectorBase_V1):
         # Don't exceed request length
         max_matchable = request.num_tokens - num_computed_tokens
         num_matched_tokens = min(num_matched_tokens, max_matchable)
-
-        import sys
-        sys.stderr.write(
-            f"[AIBRIX-DEBUG-GNMT] req={req_id} num_computed={num_computed_tokens} "
-            f"num_tokens={request.num_tokens} tracker_size="
-            f"{len(scheduler._cached_block_hashes)} matched={num_matched_tokens}\n"
-        )
-        sys.stderr.flush()
 
         return num_matched_tokens, False
 
