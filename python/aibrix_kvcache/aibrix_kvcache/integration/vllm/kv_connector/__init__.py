@@ -16,6 +16,10 @@ import importlib
 import logging
 import os
 import sys
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from vllm.v1.core.sched.output import SchedulerOutput
 
 logger = logging.getLogger(__name__)
 
@@ -27,9 +31,9 @@ def _loud(msg: str) -> None:
     sys.stderr.flush()
     logger.warning("[AIBRIX-DEBUG pid=%d] %s", pid, msg)
 
+
 VLLM_V1_WORKER_GPU_MODEL_RUNNER_MODULE = "vllm.v1.worker.gpu_model_runner"
 
-# Track if patches are applied
 _patches_applied = False
 
 
@@ -37,13 +41,15 @@ def _apply_gpu_model_runner_patches(module):
     """Apply patches to an already-imported gpu_model_runner module."""
     GPUModelRunner = module.GPUModelRunner
 
-    _loud(f"_apply_gpu_model_runner_patches: GPUModelRunner id={id(GPUModelRunner)} module={GPUModelRunner.__module__} execute_model.__name__={GPUModelRunner.execute_model.__name__} execute_model id={id(GPUModelRunner.execute_model)}")
+    _loud(
+        f"_apply_gpu_model_runner_patches: execute_model.__name__="
+        f"{GPUModelRunner.execute_model.__name__}"
+    )
 
     if GPUModelRunner.execute_model.__name__ == "_patched_execute_model":
         _loud("Already monkey-patched, skipping")
         return
 
-    # Source-patch detection: _update_states accepts load_results
     import inspect
     sig = inspect.signature(GPUModelRunner._update_states)
     if "load_results" in sig.parameters:
@@ -51,62 +57,155 @@ def _apply_gpu_model_runner_patches(module):
         return
 
     _loud("Applying patches to vLLM GPUModelRunner...")
-
-    # Import has_kv_transfer_group at patch time to avoid import errors
     from vllm.distributed.kv_transfer import has_kv_transfer_group
 
-    # ---- Patch 1: GPUModelRunner.execute_model -----------------------
-    # This patch intercepts execute_model to:
-    # 1. Call kv_connector_load_before_update() before _update_states
-    #    to load KV from external cache into GPU buffers.
-    #
-    # NOTE: With get_num_new_matched_tokens() properly implemented,
-    # the scheduler already adjusts num_computed_tokens and
-    # num_scheduled_tokens. The monkey-patch no longer needs to
-    # preprocess scheduler_output — it only needs to trigger the
-    # actual KV data transfer.
+    # ---- Patch 1: execute_model wraps load + _preprocess_* adjust ----
     _orig_execute_model = GPUModelRunner.execute_model
 
     def _patched_execute_model(self, scheduler_output, *args, **kwargs):
-        """Wrapped execute_model that calls KV connector before state updates"""
-        has_group = has_kv_transfer_group()
-        has_mixin_method = hasattr(self, "kv_connector_load_before_update")
-        has_meta = getattr(scheduler_output, "kv_connector_metadata", None) is not None
-        _loud(f"_patched_execute_model: has_group={has_group} has_mixin_method={has_mixin_method} has_meta={has_meta}")
-        if has_group and has_mixin_method:
-            _loud("branch: mixin")
-            self.kv_connector_load_before_update(scheduler_output)
-        elif has_group:
-            _loud("branch: fallback")
+        """Patched execute_model (Attempt C):
+        - Call start_load_kv_before_update() to load from L1 into GPU
+        - Apply _preprocess_* with delta detection (avoid double-adjust
+          of tokens already counted by scheduler via get_num_new_matched_tokens)
+        """
+        self._aibrix_load_results = {}
+
+        if has_kv_transfer_group():
             from vllm.distributed.kv_transfer import get_kv_transfer_group
             kv_connector = get_kv_transfer_group()
             if scheduler_output.kv_connector_metadata is not None:
                 kv_connector.bind_connector_metadata(
                     scheduler_output.kv_connector_metadata
                 )
-                _loud("calling start_load_kv_before_update")
-                kv_connector.start_load_kv_before_update()
-            else:
-                _loud("skipping: no metadata")
+                self._aibrix_load_results = (
+                    kv_connector.start_load_kv_before_update()
+                )
+
         return _orig_execute_model(self, scheduler_output, *args, **kwargs)
 
     GPUModelRunner.execute_model = _patched_execute_model
 
-    # Mark class so we never double-patch
+    # ---- Patch 2: _update_states with delta-aware preprocessing ----
+    _orig_update_states = GPUModelRunner._update_states
+
+    def _patched_update_states(self, scheduler_output):
+        load_results = getattr(self, "_aibrix_load_results", {})
+
+        # scheduler_external_tokens is populated via
+        # AIBrixOffloadingConnector.connector_scheduler._request_external_tokens.
+        # But we only have access to that on the scheduler process, not worker.
+        # For the delta detection, we piggyback on the connector metadata:
+        # the AIBrixOffloadingConnectorRequestMetadata has a load_len field
+        # which represents num_external_tokens promised by scheduler.
+        meta = getattr(scheduler_output, "kv_connector_metadata", None)
+        scheduler_adjusted_by_req: dict[str, int] = {}
+        if meta is not None and hasattr(meta, "requests"):
+            for req_id, req_meta in meta.requests.items():
+                scheduler_adjusted_by_req[req_id] = getattr(
+                    req_meta, "load_len", 0
+                )
+
+        _preprocess_new_reqs(
+            scheduler_output, load_results, scheduler_adjusted_by_req
+        )
+        _preprocess_cached_reqs(
+            scheduler_output, load_results, scheduler_adjusted_by_req
+        )
+
+        _orig_update_states(self, scheduler_output)
+
+    GPUModelRunner._update_states = _patched_update_states
+
     GPUModelRunner._aibrix_patched = True
-    _loud(f"GPUModelRunner patched. id={id(GPUModelRunner)} New execute_model id={id(GPUModelRunner.execute_model)}")
+    _loud("GPUModelRunner patched successfully")
+
+
+def _preprocess_new_reqs(
+    scheduler_output: "SchedulerOutput",
+    load_results: dict,
+    scheduler_adjusted_by_req: dict,
+) -> None:
+    """Adjust new requests — but only by the DELTA between what the worker
+    actually loaded and what the scheduler already counted externally.
+    """
+    if not load_results:
+        return
+
+    for new_req_data in scheduler_output.scheduled_new_reqs:
+        req_id = new_req_data.req_id
+        num_worker_loaded = load_results.get(req_id, 0)
+        if num_worker_loaded <= 0:
+            continue
+
+        scheduler_adjusted = scheduler_adjusted_by_req.get(req_id, 0)
+        # The scheduler already incremented num_computed_tokens by
+        # scheduler_adjusted. The worker loaded num_worker_loaded in total
+        # (may be equal or more, never less in the happy path).
+        # We only adjust by the DELTA to avoid double-counting.
+        delta = num_worker_loaded - scheduler_adjusted
+
+        if delta <= 0:
+            continue
+
+        num_scheduled = scheduler_output.num_scheduled_tokens[req_id]
+        # leave at least 1 token for compute
+        if delta >= num_scheduled:
+            delta = num_scheduled - 1
+
+        if delta <= 0:
+            continue
+
+        new_req_data.num_computed_tokens += delta
+        scheduler_output.num_scheduled_tokens[req_id] -= delta
+        scheduler_output.total_num_scheduled_tokens -= delta
+
+
+def _preprocess_cached_reqs(
+    scheduler_output: "SchedulerOutput",
+    load_results: dict,
+    scheduler_adjusted_by_req: dict,
+) -> None:
+    """Adjust cached/running requests with delta-only logic."""
+    if not load_results:
+        return
+
+    req_data = scheduler_output.scheduled_cached_reqs
+
+    for i, req_id in enumerate(req_data.req_ids):
+        num_worker_loaded = load_results.get(req_id, 0)
+        if num_worker_loaded <= 0:
+            continue
+
+        scheduler_adjusted = scheduler_adjusted_by_req.get(req_id, 0)
+        delta = num_worker_loaded - scheduler_adjusted
+
+        if delta <= 0:
+            continue
+
+        num_scheduled = scheduler_output.num_scheduled_tokens[req_id]
+        if delta >= num_scheduled:
+            delta = num_scheduled - 1
+
+        if delta <= 0:
+            continue
+
+        req_data.num_computed_tokens[i] += delta
+        if req_data.new_token_ids and req_data.new_token_ids[i]:
+            req_data.new_token_ids[i] = req_data.new_token_ids[i][delta:]
+        scheduler_output.num_scheduled_tokens[req_id] -= delta
+        scheduler_output.total_num_scheduled_tokens -= delta
 
 
 def aibrix_patch_vllm():
     """Apply AIBrix patches to vLLM."""
     _loud("aibrix_patch_vllm() invoked")
-    # Patch GPUModelRunner
     try:
         module = importlib.import_module(VLLM_V1_WORKER_GPU_MODEL_RUNNER_MODULE)
         _apply_gpu_model_runner_patches(module)
     except ImportError as e:
         _loud(f"Failed to patch gpu_model_runner: {e}")
 
+    global _patches_applied
     _patches_applied = True
 
 

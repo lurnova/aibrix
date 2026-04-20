@@ -999,10 +999,12 @@ class AIBrixOffloadingConnectorWorker:
 
         for seq_request_id, num_fetched_tokens in stats.items():
             seq_request_meta = metadata[seq_request_id]
-            # NOTE: In the new flow (get_num_new_matched_tokens reports
-            # external hits to the scheduler), context_len and query_len
-            # are ALREADY adjusted by vLLM scheduler before we get here.
-            # We must NOT double-adjust them. We only transition state.
+            # ORIGINAL speculative behavior: adjust metadata based on
+            # actually-loaded tokens. _preprocess_* in the monkey-patch
+            # uses delta detection (num_worker_loaded - scheduler_already
+            # _adjusted) to avoid double-count vs get_num_new_matched_tokens.
+            seq_request_meta.query_len -= num_fetched_tokens
+            seq_request_meta.context_len += num_fetched_tokens
             seq_request_meta.state = (
                 AIBrixOffloadingConnectorRequestState.WAITING_FOR_SEND
             )
@@ -1018,39 +1020,20 @@ class AIBrixOffloadingConnectorWorker:
         seq_cached_meta = self._meta_cache[seq_request_id]
         seq_all_tokens = seq_cached_meta.get_context_tokens_view()
         assert seq_all_tokens is not None, "seq_all_tokens is None"
-
-        # load_len is the number of tokens the scheduler promised are in
-        # the external L1 cache (via get_num_new_matched_tokens). These
-        # are already counted in context_len. We need to LOAD them from
-        # L1 into GPU KV buffer. Tokens to the LEFT of these are local
-        # (computed in a previous step).
-        load_len = seq_request_meta.load_len
         seq_context_len = seq_request_meta.context_len
+
         prompt_len = seq_request_meta.prompt_len
+        query_len = seq_request_meta.query_len
 
-        if load_len <= 0:
-            # Nothing to load from external cache
-            return 0
-
-        # Split: local_context is tokens computed locally; the last
-        # load_len tokens of context_len come from external cache.
-        local_context_len = seq_context_len - load_len
-        assert local_context_len >= 0, (
-            f"local_context_len={local_context_len} "
-            f"(context_len={seq_context_len}, load_len={load_len})"
-        )
-
-        # Align local context DOWN to block boundary. The load range
-        # starts here and must span full cache blocks.
+        # align to block boundary (ORIGINAL speculative behavior)
         aligned_context_len = round_down(
-            local_context_len, self.cache_block_ntokens
+            seq_context_len, self.cache_block_ntokens
         )
-        # Account for unaligned portion of local context (partial block)
-        shift_len = local_context_len - aligned_context_len
-        # Total load range aligned to full cache blocks
+        actual_query_len = seq_context_len + query_len - aligned_context_len
         aligned_query_len = round_down(
-            shift_len + load_len, self.cache_block_ntokens
+            actual_query_len, self.cache_block_ntokens
         )
+        shift_len = seq_context_len - aligned_context_len
 
         assert prompt_len >= aligned_context_len + aligned_query_len, (
             f"{prompt_len}<{aligned_context_len}+{aligned_query_len}"
@@ -1062,7 +1045,7 @@ class AIBrixOffloadingConnectorWorker:
         )
         if aligned_query_len < threshold:
             logger.debug(
-                "Skip Request[id=%s, context_len=%d, load_len=%d]",
+                "Skip Request[id=%s, context_len=%d, query_len=%d]",
                 seq_request_id,
                 aligned_context_len,
                 aligned_query_len,
