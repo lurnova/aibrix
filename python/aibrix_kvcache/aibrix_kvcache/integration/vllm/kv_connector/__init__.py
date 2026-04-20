@@ -93,13 +93,17 @@ def _apply_gpu_model_runner_patches(module):
         result = _orig_execute_model(self, scheduler_output, *args, **kwargs)
 
         # SAVE phase — explicit wait_for_save() call (Attempt A)
-        # vLLM's native _get_kv_connector_output context manager doesn't
-        # invoke wait_for_save with our monkey-patch setup, so we do it here.
+        # vLLM's native _get_kv_connector_output context manager may clear
+        # _connector_metadata between the forward and this point, so we
+        # re-bind metadata before calling wait_for_save.
         if has_group:
             from vllm.distributed.kv_transfer import get_kv_transfer_group
             kv_connector = get_kv_transfer_group()
             if scheduler_output.kv_connector_metadata is not None:
                 try:
+                    kv_connector.bind_connector_metadata(
+                        scheduler_output.kv_connector_metadata
+                    )
                     _loud("calling wait_for_save")
                     kv_connector.wait_for_save()
                 except Exception as e:
