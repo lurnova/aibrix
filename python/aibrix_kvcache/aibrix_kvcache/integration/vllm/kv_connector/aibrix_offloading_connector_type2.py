@@ -42,17 +42,11 @@ from aibrix_kvcache.profiling import tag_wrapper
 
 from .aibrix_offloading_connector_type1 import (
     AIBrixOffloadingConnector as AIBrixOffloadingConnectorType1,
-)
-from .aibrix_offloading_connector_type1 import (
     AIBrixOffloadingConnectorMetadata,
     AIBrixOffloadingConnectorRequestMetadata,
     AIBrixOffloadingConnectorRequestState,
-)
-from .aibrix_offloading_connector_type1 import (
-    AIBrixOffloadingConnectorScheduler as AIBrixOffloadingConnectorSchedulerType1,  # noqa: E501
-)
-from .aibrix_offloading_connector_type1 import (
-    AIBrixOffloadingConnectorWorker as AIBrixOffloadingConnectorWorkerType1,
+    AIBrixOffloadingConnectorScheduler as Type1Scheduler,
+    AIBrixOffloadingConnectorWorker as Type1Worker,
 )
 
 if TYPE_CHECKING:
@@ -68,14 +62,12 @@ OFFLOADING_CONNECTOR_SUPPORTED_ATTN_BACKENDS = {
 }
 
 
-class AIBrixOffloadingConnectorScheduler(
-    AIBrixOffloadingConnectorSchedulerType1
-):
+class AIBrixOffloadingConnectorScheduler(Type1Scheduler):
     def __init__(self, config: "VllmConfig"):
         super().__init__(config)
 
 
-class AIBrixOffloadingConnectorWorker(AIBrixOffloadingConnectorWorkerType1):
+class AIBrixOffloadingConnectorWorker(Type1Worker):
     """AIBrixOffloadingConnectorWorker carries out the data-plane operations."""
 
     def __init__(self, config: "VllmConfig"):
