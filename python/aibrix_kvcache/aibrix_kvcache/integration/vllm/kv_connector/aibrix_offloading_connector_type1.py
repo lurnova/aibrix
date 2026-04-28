@@ -1863,9 +1863,22 @@ class AIBrixOffloadingConnector(KVConnectorBase_V1):
 
         num_matched_tokens = num_matched_blocks * block_size
 
-        # Don't exceed request length
+        # Don't exceed request length. Cap by both ``num_tokens`` (total =
+        # prompt + generated) and ``num_prompt_tokens`` (prompt only) so we
+        # never claim KV cache for output-token positions. vLLM v0.20+
+        # asserts ``num_computed_tokens <= num_prompt_tokens`` while
+        # ``request.prefill_stats is not None`` (scheduler.py:651): the
+        # double cap makes that assertion unhitable even in pathological
+        # scheduling paths (preemption, spec-decode) where ``num_tokens``
+        # exceeds ``num_prompt_tokens``. ``getattr`` keeps us forward-/
+        # backward-compatible if the attribute is renamed.
+        num_prompt_tokens = getattr(request, "num_prompt_tokens", None)
         max_matchable = request.num_tokens - num_computed_tokens
-        num_matched_tokens = min(num_matched_tokens, max_matchable)
+        if num_prompt_tokens is not None:
+            max_matchable = min(
+                max_matchable, num_prompt_tokens - num_computed_tokens
+            )
+        num_matched_tokens = min(num_matched_tokens, max(0, max_matchable))
 
         return num_matched_tokens, False
 
