@@ -1,4 +1,17 @@
 ARG VLLM_VERSION=v0.19.0
+# CUDA toolkit version of the builder image. Must match the CUDA version
+# that the vLLM base image ships with, otherwise the compiled
+# `_aibrix_C.abi3.so` will link against a `libcudart.so.X` that the
+# runtime image doesn't have.
+#   v0.14.x / v0.18.x / v0.19.x  → 12.1
+#   v0.20.x+                      → 13.0
+# Default keeps existing builds (without explicit override) working
+# unchanged for v0.19.0.
+ARG CUDA_VERSION=12.1
+# CUDA suffix for the NIXL pip package. Must match CUDA_VERSION's major.
+#   CUDA 12.x → cu12
+#   CUDA 13.x → cu13
+ARG NIXL_CUDA_SUFFIX=cu12
 
 # Extract torch version from the vLLM base image
 FROM vllm/vllm-openai:${VLLM_VERSION} AS torch-version
@@ -6,7 +19,8 @@ ARG PYTHON_BIN=python3
 RUN ${PYTHON_BIN} -m pip show torch | awk '/Version/{print $2}' | sed 's/+.*$//' > /torch_version.txt
 
 # Builder stage
-FROM docker.io/pytorch/manylinux2_28-builder:cuda12.1 AS builder
+FROM docker.io/pytorch/manylinux2_28-builder:cuda${CUDA_VERSION} AS builder
+ARG CUDA_VERSION
 
 ARG AIBRIX_REPO=https://github.com/vllm-project/aibrix
 ARG AIBRIX_BRANCH=v0.5.0
@@ -52,7 +66,8 @@ RUN PATCH_FILE="/tmp/aibrix/python/aibrix_kvcache/integration/vllm/patches/vllm_
 
 RUN rm -rf /tmp/aibrix
 
-RUN pip install nixl==${NIXL_VERSION} nixl-cu12==${NIXL_VERSION}
+ARG NIXL_CUDA_SUFFIX
+RUN pip install nixl==${NIXL_VERSION} nixl-${NIXL_CUDA_SUFFIX}==${NIXL_VERSION}
 # Install network debugging tools (non-critical — used for NIXL/RDMA debug)
 # Package availability varies across base image versions, so we make
 # this best-effort.

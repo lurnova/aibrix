@@ -38,6 +38,24 @@ jobs:
           if [ -z "$VLLM_VERSION" ]; then VLLM_VERSION="v0.19.0"; fi
           echo "version=$VLLM_VERSION" >> $GITHUB_OUTPUT
 
+      - name: Resolve CUDA version from vLLM version
+        id: cuda
+        run: |
+          # vLLM bumped its base image's CUDA version 12.9.1 → 13.0.2
+          # between v0.19 and v0.20. The aibrix_kvcache wheel must be
+          # built with a builder image whose CUDA major matches the
+          # base, otherwise _aibrix_C.abi3.so links against a
+          # libcudart.so.X that the runtime image doesn't ship.
+          case "${{ steps.vllm.outputs.version }}" in
+            v0.20.*|v0.21.*)
+              CUDA_VERSION="13.0"; NIXL_SUFFIX="cu13" ;;
+            v0.14.*|v0.18.*|v0.19.*|*)
+              CUDA_VERSION="12.1"; NIXL_SUFFIX="cu12" ;;
+          esac
+          echo "cuda=$CUDA_VERSION" >> $GITHUB_OUTPUT
+          echo "nixl_suffix=$NIXL_SUFFIX" >> $GITHUB_OUTPUT
+          echo "Resolved CUDA_VERSION=$CUDA_VERSION NIXL_CUDA_SUFFIX=$NIXL_SUFFIX for vLLM ${{ steps.vllm.outputs.version }}"
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -75,6 +93,8 @@ jobs:
           platforms: linux/amd64
           build-args: |
             VLLM_VERSION=${{ steps.vllm.outputs.version }}
+            CUDA_VERSION=${{ steps.cuda.outputs.cuda }}
+            NIXL_CUDA_SUFFIX=${{ steps.cuda.outputs.nixl_suffix }}
             AIBRIX_BRANCH=${{ github.ref_name }}
             AIBRIX_REPO=https://github.com/${{ github.repository }}.git
           labels: ${{ steps.meta.outputs.labels }}
